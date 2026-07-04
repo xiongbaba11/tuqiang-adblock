@@ -1,4 +1,4 @@
-name: Build Minimal AdBlock+NoUpdate
+name: Build Fixed Dylib
 on:
   push:
     branches: [ main ]
@@ -9,14 +9,126 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build hook dylib
+      - name: Build and fix dylib
         run: |
+          cat > fix_indirect.py << 'PYEOF'
+          import struct, sys
+
+          def fix_dylib(path):
+              with open(path, 'rb') as f:
+                  data = bytearray(f.read())
+              
+              magic = struct.unpack_from('<I', data, 0)[0]
+              ncmds = struct.unpack_from('<I', data, 16)[0]
+              
+              # Find DYSYMTAB and all LC_LOAD_DYLIB commands
+              dysymtab_off = None
+              dysymtab_sz = None
+              load_libs = []  # list of (name, offset_in_cmds)
+              off = 32
+              for i in range(ncmds):
+                  cmd, sz = struct.unpack_from('<II', data, off)
+                  if cmd == 0x0B:
+                      dysymtab_off = off
+                      dysymtab_sz = sz
+                  elif cmd == 0x0C:
+                      name_off = struct.unpack_from('<I', data, off+8)[0]
+                      name_bytes = data[off+name_off:]
+                      name = name_bytes.split(b'\x00')[0].decode()
+                      load_libs.append((name, i))
+                  off += sz
+              
+              if dysymtab_off is None:
+                  print('No DYSYMTAB found')
+                  sys.exit(1)
+              
+              print(f'Found DYSYMTAB at {dysymtab_off}')
+              print(f'Found {len(load_libs)} LC_LOAD_DYLIB commands')
+              
+              # Build a map: lib name -> ordinal (1-based)
+              lib_to_ord = {}
+              for j, (name, idx) in enumerate(load_libs):
+                  lib_to_ord[name] = j + 1  # ordinals are 1-based
+                  print(f'  ordinal {j+1}: {name}')
+              
+              # Read DYSYMTAB fields
+              iundefsym = struct.unpack_from('<I', data, dysymtab_off+8+16)[0]
+              nundefsym = struct.unpack_from('<I', data, dysymtab_off+8+20)[0]
+              indirectsymoff = struct.unpack_from('<I', data, dysymtab_off+8+48)[0]
+              nindirectsyms = struct.unpack_from('<I', data, dysymtab_off+8+52)[0]
+              
+              # Read SYMTAB fields  
+              symtab_off = dysymtab_off  # need to find SYMTAB
+              off2 = 32
+              symoff = stroff = nsyms = 0
+              for i in range(ncmds):
+                  cmd, sz = struct.unpack_from('<II', data, off2)
+                  if cmd == 0x02:  # SYMTAB
+                      symoff = struct.unpack_from('<I', data, off2+8)[0]
+                      nsyms = struct.unpack_from('<I', data, off2+12)[0]
+                      stroff = struct.unpack_from('<I', data, off2+16)[0]
+                  off2 += sz
+              
+              # Read string table
+              strtab = data[stroff:]
+              
+              # Read symbol table
+              print(f'nsyms={nsyms}, nundefsym={nundefsym}, iundefsym={iundefsym}')
+              
+              # For each undefined symbol, find its target lib
+              # nlist_64 is 16 bytes: n_strx(4), n_type(1), n_sect(1), n_desc(2), n_value(8)
+              for k in range(nundefsym):
+                  sym_idx = iundefsym + k
+                  sym_entry = data[symoff + sym_idx * 16:symoff + sym_idx * 16 + 16]
+                  n_strx = struct.unpack_from('<I', sym_entry, 0)[0]
+                  n_type = sym_entry[4]
+                  name = strtab[n_strx:].split(b'\x00')[0].decode()
+                  if n_type & 0x0E == 0x01:  # N_EXT | N_UNDF
+                      # Determine which lib this symbol belongs to
+                      target_lib = None
+                      if name.startswith('_OBJC_CLASS') or name.startswith('objc_') or name.startswith('class_') or name.startswith('_objc_'):
+                          # ObjC runtime symbols
+                          target_lib = '/usr/lib/libobjc.A.dylib'
+                      elif name.startswith('NS') or name.startswith('_NS') or name.startswith('__NS'):
+                          target_lib = '/System/Library/Frameworks/Foundation.framework/Foundation'
+                      elif name.startswith('UI') or name.startswith('_UI') or name.startswith('CG'):
+                          target_lib = '/System/Library/Frameworks/UIKit.framework/UIKit'
+                      elif name.startswith('CF') or name.startswith('_CF'):
+                          target_lib = '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation'
+                      else:
+                          # Default to libSystem (contains libc etc)
+                          target_lib = '/usr/lib/libSystem.B.dylib'
+                      
+                      if target_lib in lib_to_ord:
+                          target_ord = lib_to_ord[target_lib]
+                      else:
+                          target_ord = 1  # fallback to first
+                      
+                      # Find which indirect symbol entry corresponds to this symbol
+                      # and fix its lib_ord
+                      indirect_data = data[indirectsymoff:indirectsymoff + nindirectsyms * 4]
+                      for j in range(nindirectsyms):
+                          entry = struct.unpack_from('<I', indirect_data, j*4)[0]
+                          if (entry & 0xFFFFFF) == sym_idx:  # symbol index in lower 24 bits
+                              old_ord = (entry >> 8) & 0xFF
+                              new_entry = (entry & 0xFFFF00FF) | (target_ord << 8)
+                              struct.pack_into('<I', data, indirectsymoff + j*4, new_entry)
+                              print(f'  Fixed {name}: lib_ord {old_ord} -> {target_ord} ({target_lib})')
+                              break
+              
+              with open(path, 'wb') as f:
+                  f.write(data)
+              print('Done!')
+          
+          fix_dylib(sys.argv[1])
+          PYEOF
+          
+          # Build hook dylib
           cat > hook_ad.m << 'OBJCEOF'
           #import <Foundation/Foundation.h>
           #import <objc/runtime.h>
           #import <UIKit/UIKit.h>
 
-          // Empty implementations for splash ad load methods
           static void splash_noop(id self, SEL _cmd) {
               NSLog(@"[Hook] Blocked: %@ - %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
           }
@@ -27,100 +139,38 @@ jobs:
               NSLog(@"[Hook] Blocked: %@ - %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
           }
           static BOOL return_no(id self, SEL _cmd) {
-              NSLog(@"[Hook] Return NO: %@ - %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
               return NO;
           }
-          static BOOL return_yes(id self, SEL _cmd) {
-              NSLog(@"[Hook] Return YES: %@ - %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
-              return YES;
-          }
-          static void return_nil(id self, SEL _cmd) {
-              NSLog(@"[Hook] Return nil: %@ - %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
-          }
 
-          // Hook specific methods on a class
           static void hook_method(Class cls, SEL sel, IMP newImp) {
               if (!cls) return;
               Method method = class_getInstanceMethod(cls, sel);
-              if (method) {
-                  method_setImplementation(method, newImp);
-                  NSLog(@"[Hook] Hooked %@ - %@", NSStringFromClass(cls), NSStringFromSelector(sel));
-              }
-          }
-
-          // Hook class method
-          static void hook_class_method(Class cls, SEL sel, IMP newImp) {
-              if (!cls) return;
-              Method method = class_getClassMethod(cls, sel);
-              if (method) {
-                  method_setImplementation(method, newImp);
-                  NSLog(@"[Hook] Hooked class %@ +%@", NSStringFromClass(cls), NSStringFromSelector(sel));
-              }
+              if (method) method_setImplementation(method, newImp);
           }
 
           __attribute__((constructor))
           static void hook_init(void) {
-              NSLog(@"[Hook] Initializing...");
-              
-              // ===== AD BLOCK =====
-              // Hook specific splash ad classes
               hook_method(objc_getClass("GDTSplashAd"), @selector(loadAdAndShowInWindow:), (IMP)splash_noop_window);
               hook_method(objc_getClass("GDTSplashAd"), @selector(loadAd), (IMP)splash_noop);
               hook_method(objc_getClass("GDTSplashAd"), @selector(loadAdAndShowInRootViewController:), (IMP)splash_noop_vc);
-              
               hook_method(objc_getClass("AMPSSplashAd"), @selector(loadAd), (IMP)splash_noop);
               hook_method(objc_getClass("AMPSSplashAd"), @selector(loadAdAndShow), (IMP)splash_noop);
-              
               hook_method(objc_getClass("CSJSplashAd"), @selector(loadAd), (IMP)splash_noop);
               hook_method(objc_getClass("CSJSplashAd"), @selector(loadAdAndShowInWindow:), (IMP)splash_noop_window);
-              
               hook_method(objc_getClass("BUSplashAd"), @selector(loadAd), (IMP)splash_noop);
-              hook_method(objc_getClass("BUSplashAd"), @selector(loadAdAndShowInWindow:), (IMP)splash_noop_window);
-              
               hook_method(objc_getClass("KSSplashAdView"), @selector(loadAd), (IMP)splash_noop);
               hook_method(objc_getClass("BaiduMobAdSplash"), @selector(loadAd), (IMP)splash_noop);
               hook_method(objc_getClass("MTGSplashAD"), @selector(loadAd), (IMP)splash_noop);
               hook_method(objc_getClass("AdGainSplashAd"), @selector(loadAd), (IMP)splash_noop);
-              hook_method(objc_getClass("BeiZiSplashAd"), @selector(loadAd), (IMP)splash_noop);
               
-              // ===== UPDATE BLOCK =====
-              // Hook specific update check methods
-              // Find all classes that respond to checkNewestVersion:
-              unsigned int classCount = 0;
-              Class *allClasses = objc_copyClassList(&classCount);
-              for (unsigned int i = 0; i < classCount; i++) {
-                  Class cls = allClasses[i];
-                  NSString *clsName = NSStringFromClass(cls);
-                  
-                  // Skip known ad/map SDK classes
-                  if ([clsName hasPrefix:@"GMS"] || [clsName hasPrefix:@"AMap"] || 
-                      [clsName hasPrefix:@"Baidu"] || [clsName hasPrefix:@"ABU"] ||
-                      [clsName hasPrefix:@"CSJ"] || [clsName hasPrefix:@"KS"] ||
-                      [clsName hasPrefix:@"GDT"] || [clsName hasPrefix:@"MTG"] ||
-                      [clsName hasPrefix:@"BeiZi"] || [clsName hasPrefix:@"AdGain"] ||
-                      [clsName hasPrefix:@"AMPS"] || [clsName hasPrefix:@"Google"] ||
-                      [clsName hasPrefix:@"FIR"] || [clsName hasPrefix:@"NS"] ||
-                      [clsName hasPrefix:@"UI"] || [clsName hasPrefix:@"_"] ||
-                      [clsName hasPrefix:@"NSKV"] || [clsName hasPrefix:@"__"]) {
-                      continue;
-                  }
-                  
-                  // Check for specific update-related methods
-                  Method checkNewestVersion = class_getInstanceMethod(cls, @selector(checkNewestVersion:));
-                  Method checkVersion = class_getInstanceMethod(cls, @selector(checkVersion));
-                  
-                  if (checkNewestVersion) {
-                      method_setImplementation(checkNewestVersion, (IMP)splash_noop);
-                      NSLog(@"[Hook] Update blocked: %@ - checkNewestVersion:", clsName);
-                  }
-                  if (checkVersion) {
-                      method_setImplementation(checkVersion, (IMP)splash_noop);
-                      NSLog(@"[Hook] Update blocked: %@ - checkVersion", clsName);
-                  }
+              // Block update
+              unsigned int count = 0;
+              Class *classes = objc_copyClassList(&count);
+              for (unsigned int i = 0; i < count; i++) {
+                  Method m = class_getInstanceMethod(classes[i], @selector(checkNewestVersion:));
+                  if (m) method_setImplementation(m, (IMP)splash_noop);
               }
-              free(allClasses);
-              
-              NSLog(@"[Hook] Done - ads and update prompts blocked");
+              free(classes);
           }
           OBJCEOF
           
@@ -136,7 +186,40 @@ jobs:
             -o libHook.dylib \
             hook_ad.m
           
-          file libHook.dylib
+          echo "=== Before fix ==="
+          python3 -c "
+          import struct
+          with open('libHook.dylib','rb') as f: d=f.read()
+          ncmds=struct.unpack('<I',d[16:20])[0]
+          off=32
+          for i in range(ncmds):
+              cmd,sz=struct.unpack('<II',d[off:off+8])
+              if cmd==0x0B:
+                  ni=struct.unpack_from('<I',d,off+8+52)[0]
+                  io=struct.unpack_from('<I',d,off+8+48)[0]
+                  ords=set([struct.unpack_from('<I',d,io+j*4)[0]>>8&0xFF for j in range(ni)])
+                  print(f'lib_ords: {ords}')
+              off+=sz
+          "
+          
+          python3 fix_indirect.py libHook.dylib
+          
+          echo "=== After fix ==="
+          python3 -c "
+          import struct
+          with open('libHook.dylib','rb') as f: d=f.read()
+          ncmds=struct.unpack('<I',d[16:20])[0]
+          off=32
+          for i in range(ncmds):
+              cmd,sz=struct.unpack('<II',d[off:off+8])
+              if cmd==0x0B:
+                  ni=struct.unpack_from('<I',d,off+8+52)[0]
+                  io=struct.unpack_from('<I',d,off+8+48)[0]
+                  ords=set([struct.unpack_from('<I',d,io+j*4)[0]>>8&0xFF for j in range(ni)])
+                  print(f'lib_ords: {ords}')
+              off+=sz
+          "
+          
           ls -la libHook.dylib
 
       - uses: actions/upload-artifact@v4
