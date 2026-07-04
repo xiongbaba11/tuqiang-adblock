@@ -1,4 +1,4 @@
-name: Build AdBlock+NoUpdate Dylib
+name: Build Minimal AdBlock+NoUpdate
 on:
   push:
     branches: [ main ]
@@ -16,15 +16,15 @@ jobs:
           #import <objc/runtime.h>
           #import <UIKit/UIKit.h>
 
-          // ===== AD BLOCK =====
+          // Empty implementations for splash ad load methods
           static void splash_noop(id self, SEL _cmd) {
               NSLog(@"[Hook] Blocked: %@ - %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
           }
           static void splash_noop_window(id self, SEL _cmd, id window) {
-              NSLog(@"[Hook] Blocked (window): %@ - %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
+              NSLog(@"[Hook] Blocked: %@ - %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
           }
           static void splash_noop_vc(id self, SEL _cmd, id vc) {
-              NSLog(@"[Hook] Blocked (vc): %@ - %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
+              NSLog(@"[Hook] Blocked: %@ - %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
           }
           static BOOL return_no(id self, SEL _cmd) {
               NSLog(@"[Hook] Return NO: %@ - %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
@@ -34,74 +34,28 @@ jobs:
               NSLog(@"[Hook] Return YES: %@ - %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
               return YES;
           }
-
-          static void hook_class_methods(Class cls, BOOL hookLoad, BOOL hookShow, BOOL hookCheck) {
-              if (!cls) return;
-              unsigned int count = 0;
-              Method *methods = class_copyMethodList(cls, &count);
-              for (unsigned int i = 0; i < count; i++) {
-                  SEL name = method_getName(methods[i]);
-                  NSString *selName = NSStringFromSelector(name);
-                  NSString *lower = [selName lowercaseString];
-                  
-                  if (hookLoad && [lower containsString:@"load"] && [lower containsString:@"ad"]) {
-                      if ([selName containsString:@"Window:"] || [selName containsString:@"window:"]) {
-                          method_setImplementation(methods[i], (IMP)splash_noop_window);
-                      } else if ([selName containsString:@"ViewController:"] || [selName containsString:@"RootViewController:"]) {
-                          method_setImplementation(methods[i], (IMP)splash_noop_vc);
-                      } else {
-                          method_setImplementation(methods[i], (IMP)splash_noop);
-                      }
-                      NSLog(@"[Hook] Hooked %@ - %@", NSStringFromClass(cls), selName);
-                  } else if (hookShow && ([lower isEqualToString:@"showad"] || [lower isEqualToString:@"show"])) {
-                      method_setImplementation(methods[i], (IMP)splash_noop);
-                      NSLog(@"[Hook] Hooked %@ - %@", NSStringFromClass(cls), selName);
-                  } else if (hookCheck && ([lower containsString:@"checknewestversion"] || 
-                                           [lower containsString:@"checkversion"] ||
-                                           [lower containsString:@"checkupdate"])) {
-                      method_setImplementation(methods[i], (IMP)splash_noop);
-                      NSLog(@"[Hook] Hooked %@ - %@", NSStringFromClass(cls), selName);
-                  }
-              }
-              free(methods);
+          static void return_nil(id self, SEL _cmd) {
+              NSLog(@"[Hook] Return nil: %@ - %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
           }
 
-          static void hook_class_meta_methods(Class cls) {
+          // Hook specific methods on a class
+          static void hook_method(Class cls, SEL sel, IMP newImp) {
               if (!cls) return;
-              Class metaCls = object_getClass(cls);
-              if (!metaCls) return;
-              unsigned int count = 0;
-              Method *methods = class_copyMethodList(metaCls, &count);
-              for (unsigned int i = 0; i < count; i++) {
-                  SEL name = method_getName(methods[i]);
-                  NSString *selName = NSStringFromSelector(name);
-                  NSString *lower = [selName lowercaseString];
-                  if ([lower containsString:@"load"] && [lower containsString:@"ad"]) {
-                      method_setImplementation(methods[i], (IMP)splash_noop);
-                      NSLog(@"[Hook] Hooked class method %@ +%@", NSStringFromClass(cls), selName);
-                  }
+              Method method = class_getInstanceMethod(cls, sel);
+              if (method) {
+                  method_setImplementation(method, newImp);
+                  NSLog(@"[Hook] Hooked %@ - %@", NSStringFromClass(cls), NSStringFromSelector(sel));
               }
-              free(methods);
           }
 
-          // Hook ALL methods of a class that match patterns
-          static void hook_all_matching(Class cls, NSArray *patterns) {
+          // Hook class method
+          static void hook_class_method(Class cls, SEL sel, IMP newImp) {
               if (!cls) return;
-              unsigned int count = 0;
-              Method *methods = class_copyMethodList(cls, &count);
-              for (unsigned int i = 0; i < count; i++) {
-                  SEL name = method_getName(methods[i]);
-                  NSString *selName = NSStringFromSelector(name);
-                  NSString *lower = [selName lowercaseString];
-                  for (NSString *pattern in patterns) {
-                      if ([lower containsString:[pattern lowercaseString]]) {
-                          method_setImplementation(methods[i], (IMP)splash_noop);
-                          NSLog(@"[Hook] Hooked %@ - %@", NSStringFromClass(cls), selName);
-                          break;
-                      }
-                  }
+              Method method = class_getClassMethod(cls, sel);
+              if (method) {
+                  method_setImplementation(method, newImp);
+                  NSLog(@"[Hook] Hooked class %@ +%@", NSStringFromClass(cls), NSStringFromSelector(sel));
               }
-              free(methods);
           }
 
           __attribute__((constructor))
@@ -109,84 +63,60 @@ jobs:
               NSLog(@"[Hook] Initializing...");
               
               // ===== AD BLOCK =====
-              NSArray *splashClasses = @[
-                  @"GDTSplashAd", @"AMPSSplashAd", @"CSJSplashAd", @"BUSplashAd",
-                  @"KSSplashAdView", @"BaiduMobAdSplash", @"MTGSplashAD",
-                  @"AdGainSplashAd", @"BeiZiSplashAd", @"GMSplashAd"
-              ];
-              for (NSString *clsName in splashClasses) {
-                  Class cls = objc_getClass([clsName UTF8String]);
-                  if (cls) {
-                      hook_class_methods(cls, YES, YES, NO);
-                      hook_class_meta_methods(cls);
-                  }
-              }
+              // Hook specific splash ad classes
+              hook_method(objc_getClass("GDTSplashAd"), @selector(loadAdAndShowInWindow:), (IMP)splash_noop_window);
+              hook_method(objc_getClass("GDTSplashAd"), @selector(loadAd), (IMP)splash_noop);
+              hook_method(objc_getClass("GDTSplashAd"), @selector(loadAdAndShowInRootViewController:), (IMP)splash_noop_vc);
               
-              // Hook TQAdManager
-              Class tqAdMgr = objc_getClass("TQAdManager");
-              if (tqAdMgr) {
-                  hook_class_methods(tqAdMgr, YES, YES, NO);
-                  hook_class_meta_methods(tqAdMgr);
-              }
+              hook_method(objc_getClass("AMPSSplashAd"), @selector(loadAd), (IMP)splash_noop);
+              hook_method(objc_getClass("AMPSSplashAd"), @selector(loadAdAndShow), (IMP)splash_noop);
               
-              // Hook AMPS adapters
-              NSArray *adapterClasses = @[
-                  @"AMPSGDTSplashAdapter", @"AMPSCSJSplashAdapter",
-                  @"AMPSBZSplashAdapter", @"AdGainAMPSSplashAdapter"
-              ];
-              for (NSString *clsName in adapterClasses) {
-                  Class cls = objc_getClass([clsName UTF8String]);
-                  if (cls) {
-                      hook_class_methods(cls, YES, YES, NO);
-                      hook_class_meta_methods(cls);
-                  }
-              }
+              hook_method(objc_getClass("CSJSplashAd"), @selector(loadAd), (IMP)splash_noop);
+              hook_method(objc_getClass("CSJSplashAd"), @selector(loadAdAndShowInWindow:), (IMP)splash_noop_window);
+              
+              hook_method(objc_getClass("BUSplashAd"), @selector(loadAd), (IMP)splash_noop);
+              hook_method(objc_getClass("BUSplashAd"), @selector(loadAdAndShowInWindow:), (IMP)splash_noop_window);
+              
+              hook_method(objc_getClass("KSSplashAdView"), @selector(loadAd), (IMP)splash_noop);
+              hook_method(objc_getClass("BaiduMobAdSplash"), @selector(loadAd), (IMP)splash_noop);
+              hook_method(objc_getClass("MTGSplashAD"), @selector(loadAd), (IMP)splash_noop);
+              hook_method(objc_getClass("AdGainSplashAd"), @selector(loadAd), (IMP)splash_noop);
+              hook_method(objc_getClass("BeiZiSplashAd"), @selector(loadAd), (IMP)splash_noop);
               
               // ===== UPDATE BLOCK =====
-              // Find and hook all classes with update/version check methods
+              // Hook specific update check methods
+              // Find all classes that respond to checkNewestVersion:
               unsigned int classCount = 0;
               Class *allClasses = objc_copyClassList(&classCount);
               for (unsigned int i = 0; i < classCount; i++) {
                   Class cls = allClasses[i];
                   NSString *clsName = NSStringFromClass(cls);
                   
-                  // Hook update-related methods on ALL classes
-                  unsigned int methodCount = 0;
-                  Method *methods = class_copyMethodList(cls, &methodCount);
-                  for (unsigned int j = 0; j < methodCount; j++) {
-                      SEL name = method_getName(methods[j]);
-                      NSString *selName = NSStringFromSelector(name);
-                      NSString *lower = [selName lowercaseString];
-                      
-                      // Block version check methods
-                      if ([lower containsString:@"checknewestversion"] ||
-                          ([lower containsString:@"checkversion"] && ![lower containsString:@"abu"] && ![lower containsString:@"adn"]) ||
-                          [lower containsString:@"checkforupdate"] ||
-                          [lower containsString:@"showupdatealert"] ||
-                          [lower containsString:@"showupdateview"] ||
-                          [lower containsString:@"showupdatedialog"] ||
-                          [lower containsString:@"presentupdate"]) {
-                          
-                          // Check return type
-                          const char *typeEncoding = method_getTypeEncoding(methods[j]);
-                          if (typeEncoding && typeEncoding[0] == 'B') {
-                              // Returns BOOL - return NO
-                              method_setImplementation(methods[j], (IMP)return_no);
-                          } else {
-                              method_setImplementation(methods[j], (IMP)splash_noop);
-                          }
-                          NSLog(@"[Hook] Update blocked: %@ - %@", clsName, selName);
-                      }
-                      
-                      // Block force_new_version related
-                      if ([lower containsString:@"forcenewversion"] ||
-                          [lower containsString:@"force_new_version"] ||
-                          [lower containsString:@"isforceupdate"]) {
-                          method_setImplementation(methods[j], (IMP)return_no);
-                          NSLog(@"[Hook] Force update blocked: %@ - %@", clsName, selName);
-                      }
+                  // Skip known ad/map SDK classes
+                  if ([clsName hasPrefix:@"GMS"] || [clsName hasPrefix:@"AMap"] || 
+                      [clsName hasPrefix:@"Baidu"] || [clsName hasPrefix:@"ABU"] ||
+                      [clsName hasPrefix:@"CSJ"] || [clsName hasPrefix:@"KS"] ||
+                      [clsName hasPrefix:@"GDT"] || [clsName hasPrefix:@"MTG"] ||
+                      [clsName hasPrefix:@"BeiZi"] || [clsName hasPrefix:@"AdGain"] ||
+                      [clsName hasPrefix:@"AMPS"] || [clsName hasPrefix:@"Google"] ||
+                      [clsName hasPrefix:@"FIR"] || [clsName hasPrefix:@"NS"] ||
+                      [clsName hasPrefix:@"UI"] || [clsName hasPrefix:@"_"] ||
+                      [clsName hasPrefix:@"NSKV"] || [clsName hasPrefix:@"__"]) {
+                      continue;
                   }
-                  free(methods);
+                  
+                  // Check for specific update-related methods
+                  Method checkNewestVersion = class_getInstanceMethod(cls, @selector(checkNewestVersion:));
+                  Method checkVersion = class_getInstanceMethod(cls, @selector(checkVersion));
+                  
+                  if (checkNewestVersion) {
+                      method_setImplementation(checkNewestVersion, (IMP)splash_noop);
+                      NSLog(@"[Hook] Update blocked: %@ - checkNewestVersion:", clsName);
+                  }
+                  if (checkVersion) {
+                      method_setImplementation(checkVersion, (IMP)splash_noop);
+                      NSLog(@"[Hook] Update blocked: %@ - checkVersion", clsName);
+                  }
               }
               free(allClasses);
               
