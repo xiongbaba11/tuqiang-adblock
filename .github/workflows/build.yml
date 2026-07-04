@@ -1,0 +1,149 @@
+name: Build AdBlock Dylib
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build hook dylib
+        run: |
+          cat > hook_ad.m << 'OBJCEOF'
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+          #import <UIKit/UIKit.h>
+
+          // Empty implementations for splash ad load methods
+          static void splash_noop(id self, SEL _cmd) {
+              NSLog(@"[AdBlock] Splash ad blocked: %@", NSStringFromClass([self class]));
+          }
+          static void splash_noop_window(id self, SEL _cmd, id window) {
+              NSLog(@"[AdBlock] Splash ad blocked (window): %@", NSStringFromClass([self class]));
+          }
+          static void splash_noop_vc(id self, SEL _cmd, id vc) {
+              NSLog(@"[AdBlock] Splash ad blocked (vc): %@", NSStringFromClass([self class]));
+          }
+          static void splash_noop_show(id self, SEL _cmd) {
+              NSLog(@"[AdBlock] Splash ad show blocked: %@", NSStringFromClass([self class]));
+          }
+
+          static void hook_class(Class cls) {
+              if (!cls) return;
+              unsigned int count = 0;
+              Method *methods = class_copyMethodList(cls, &count);
+              for (unsigned int i = 0; i < count; i++) {
+                  SEL name = method_getName(methods[i]);
+                  NSString *selName = NSStringFromSelector(name);
+                  NSString *lower = [selName lowercaseString];
+                  if ([lower containsString:@"load"] && [lower containsString:@"ad"]) {
+                      const char *type = method_getTypeEncoding(methods[i]);
+                      if (type) {
+                          // Check if it takes a window/VC argument
+                          if ([selName containsString:@"Window:"] || [selName containsString:@"window:"]) {
+                              method_setImplementation(methods[i], (IMP)splash_noop_window);
+                          } else if ([selName containsString:@"ViewController:"] || [selName containsString:@"RootViewController:"]) {
+                              method_setImplementation(methods[i], (IMP)splash_noop_vc);
+                          } else {
+                              method_setImplementation(methods[i], (IMP)splash_noop);
+                          }
+                          NSLog(@"[AdBlock] Hooked %@ - %@", NSStringFromClass(cls), selName);
+                      }
+                  } else if ([lower isEqualToString:@"showad"] || [lower isEqualToString:@"show"]) {
+                      method_setImplementation(methods[i], (IMP)splash_noop_show);
+                      NSLog(@"[AdBlock] Hooked %@ - %@", NSStringFromClass(cls), selName);
+                  }
+              }
+              free(methods);
+          }
+
+          // Also hook class methods
+          static void hook_class_methods(Class cls) {
+              if (!cls) return;
+              Class metaCls = object_getClass(cls);
+              if (!metaCls) return;
+              unsigned int count = 0;
+              Method *methods = class_copyMethodList(metaCls, &count);
+              for (unsigned int i = 0; i < count; i++) {
+                  SEL name = method_getName(methods[i]);
+                  NSString *selName = NSStringFromSelector(name);
+                  NSString *lower = [selName lowercaseString];
+                  if ([lower containsString:@"load"] && [lower containsString:@"ad"]) {
+                      method_setImplementation(methods[i], (IMP)splash_noop);
+                      NSLog(@"[AdBlock] Hooked class method %@ +%@", NSStringFromClass(cls), selName);
+                  }
+              }
+              free(methods);
+          }
+
+          __attribute__((constructor))
+          static void adblock_init(void) {
+              NSLog(@"[AdBlock] Initializing...");
+              
+              // Hook all known splash ad classes
+              NSArray *splashClasses = @[
+                  @"GDTSplashAd",
+                  @"AMPSSplashAd", 
+                  @"CSJSplashAd",
+                  @"BUSplashAd",
+                  @"KSSplashAdView",
+                  @"BaiduMobAdSplash",
+                  @"MTGSplashAD",
+                  @"AdGainSplashAd",
+                  @"BeiZiSplashAd",
+                  @"GMSplashAd",
+                  @"GMKSplashAd"
+              ];
+              
+              for (NSString *clsName in splashClasses) {
+                  Class cls = objc_getClass([clsName UTF8String]);
+                  if (cls) {
+                      hook_class(cls);
+                      hook_class_methods(cls);
+                  }
+              }
+              
+              // Hook TQAdManager - find and block all load/show methods
+              Class tqAdMgr = objc_getClass("TQAdManager");
+              if (tqAdMgr) {
+                  hook_class(tqAdMgr);
+                  hook_class_methods(tqAdMgr);
+              }
+              
+              // Hook AMPS adapters
+              NSArray *adapterClasses = @[
+                  @"AMPSGDTSplashAdapter",
+                  @"AMPSCSJSplashAdapter", 
+                  @"AMPSBZSplashAdapter",
+                  @"AdGainAMPSSplashAdapter"
+              ];
+              for (NSString *clsName in adapterClasses) {
+                  Class cls = objc_getClass([clsName UTF8String]);
+                  if (cls) {
+                      hook_class(cls);
+                      hook_class_methods(cls);
+                  }
+              }
+              
+              NSLog(@"[AdBlock] Done - splash ads blocked");
+          }
+          OBJCEOF
+          
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -dynamiclib \
+            -framework Foundation \
+            -framework UIKit \
+            -fobjc-arc \
+            -O2 \
+            -mios-version-min=15.0 \
+            -install_name @rpath/libAdBlock.dylib \
+            -o libAdBlock.dylib \
+            hook_ad.m
+          
+          echo "Build complete"
+          file libAdBlock.dylib
+          ls -la libAdBlock.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: adblock-dylib
+          path: libAdBlock.dylib
