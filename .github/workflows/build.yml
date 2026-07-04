@@ -1,5 +1,9 @@
 name: Build AdBlock Dylib
-on: workflow_dispatch
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
 jobs:
   build:
     runs-on: macos-latest
@@ -12,7 +16,6 @@ jobs:
           #import <objc/runtime.h>
           #import <UIKit/UIKit.h>
 
-          // Empty implementations for splash ad load methods
           static void splash_noop(id self, SEL _cmd) {
               NSLog(@"[AdBlock] Splash ad blocked: %@", NSStringFromClass([self class]));
           }
@@ -21,9 +24,6 @@ jobs:
           }
           static void splash_noop_vc(id self, SEL _cmd, id vc) {
               NSLog(@"[AdBlock] Splash ad blocked (vc): %@", NSStringFromClass([self class]));
-          }
-          static void splash_noop_show(id self, SEL _cmd) {
-              NSLog(@"[AdBlock] Splash ad show blocked: %@", NSStringFromClass([self class]));
           }
 
           static void hook_class(Class cls) {
@@ -35,27 +35,22 @@ jobs:
                   NSString *selName = NSStringFromSelector(name);
                   NSString *lower = [selName lowercaseString];
                   if ([lower containsString:@"load"] && [lower containsString:@"ad"]) {
-                      const char *type = method_getTypeEncoding(methods[i]);
-                      if (type) {
-                          // Check if it takes a window/VC argument
-                          if ([selName containsString:@"Window:"] || [selName containsString:@"window:"]) {
-                              method_setImplementation(methods[i], (IMP)splash_noop_window);
-                          } else if ([selName containsString:@"ViewController:"] || [selName containsString:@"RootViewController:"]) {
-                              method_setImplementation(methods[i], (IMP)splash_noop_vc);
-                          } else {
-                              method_setImplementation(methods[i], (IMP)splash_noop);
-                          }
-                          NSLog(@"[AdBlock] Hooked %@ - %@", NSStringFromClass(cls), selName);
+                      if ([selName containsString:@"Window:"] || [selName containsString:@"window:"]) {
+                          method_setImplementation(methods[i], (IMP)splash_noop_window);
+                      } else if ([selName containsString:@"ViewController:"] || [selName containsString:@"RootViewController:"]) {
+                          method_setImplementation(methods[i], (IMP)splash_noop_vc);
+                      } else {
+                          method_setImplementation(methods[i], (IMP)splash_noop);
                       }
+                      NSLog(@"[AdBlock] Hooked %@ - %@", NSStringFromClass(cls), selName);
                   } else if ([lower isEqualToString:@"showad"] || [lower isEqualToString:@"show"]) {
-                      method_setImplementation(methods[i], (IMP)splash_noop_show);
+                      method_setImplementation(methods[i], (IMP)splash_noop);
                       NSLog(@"[AdBlock] Hooked %@ - %@", NSStringFromClass(cls), selName);
                   }
               }
               free(methods);
           }
 
-          // Also hook class methods
           static void hook_class_methods(Class cls) {
               if (!cls) return;
               Class metaCls = object_getClass(cls);
@@ -78,7 +73,6 @@ jobs:
           static void adblock_init(void) {
               NSLog(@"[AdBlock] Initializing...");
               
-              // Hook all known splash ad classes
               NSArray *splashClasses = @[
                   @"GDTSplashAd",
                   @"AMPSSplashAd", 
@@ -89,8 +83,7 @@ jobs:
                   @"MTGSplashAD",
                   @"AdGainSplashAd",
                   @"BeiZiSplashAd",
-                  @"GMSplashAd",
-                  @"GMKSplashAd"
+                  @"GMSplashAd"
               ];
               
               for (NSString *clsName in splashClasses) {
@@ -101,14 +94,12 @@ jobs:
                   }
               }
               
-              // Hook TQAdManager - find and block all load/show methods
               Class tqAdMgr = objc_getClass("TQAdManager");
               if (tqAdMgr) {
                   hook_class(tqAdMgr);
                   hook_class_methods(tqAdMgr);
               }
               
-              // Hook AMPS adapters
               NSArray *adapterClasses = @[
                   @"AMPSGDTSplashAdapter",
                   @"AMPSCSJSplashAdapter", 
@@ -139,7 +130,6 @@ jobs:
             -o libAdBlock.dylib \
             hook_ad.m
           
-          echo "Build complete"
           file libAdBlock.dylib
           ls -la libAdBlock.dylib
 
